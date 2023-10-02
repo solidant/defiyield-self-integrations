@@ -1,9 +1,20 @@
 import type { ModuleDefinitionInterface } from '@defiyield/sandbox';
-import { GET_VAULTS_QUERY, GQL_HEADERS, Vault } from '../helpers/gql';
-import { FetchPoolsContext } from '../../../../sandbox/src/types/module';
+import {
+  Aprs,
+  GET_DNFTS_QUERY,
+  GET_VAULTS_QUERY,
+  GET_VAULT_APRS,
+  GQL_HEADERS,
+  UserDeposits,
+  Vault,
+} from '../helpers/gql';
+import { FetchPoolsContext, Pool, Token } from '../../../../sandbox/src/types/module';
 import SPOOL_ABI from '../abis/abi.json';
-import * as dotenv from 'dotenv';
-import { ethers } from 'ethers';
+import { ethers, BigNumber } from 'ethers';
+
+const SPOOL_LENS_ADDRESS = '0x8aa6174333F75421903b2B5c70DdF8DA5D84f74F';
+const SUBGRAPH_ENDPOINT =
+  'https://api.studio.thegraph.com/query/41372/spool-v2_mainnet/version/latest';
 
 export const SpoolModule: ModuleDefinitionInterface = {
   name: 'SpoolModule',
@@ -11,9 +22,8 @@ export const SpoolModule: ModuleDefinitionInterface = {
   type: 'pools',
 
   async preloadTokens(ctx) {
-    dotenv.config({ path: `${__dirname}\\.env` });
     const allTokens = await ctx.axios({
-      url: process.env['DEFIYIELD_GRAPHQL_ENDPOINT'],
+      url: SUBGRAPH_ENDPOINT,
       method: 'POST',
       headers: GQL_HEADERS,
       data: {
@@ -40,7 +50,7 @@ export const SpoolModule: ModuleDefinitionInterface = {
 
   async fetchPools(ctx) {
     const smartVaultsData = await ctx.axios({
-      url: process.env['DEFIYIELD_GRAPHQL_ENDPOINT'],
+      url: SUBGRAPH_ENDPOINT,
       method: 'POST',
       headers: GQL_HEADERS,
       data: {
@@ -57,31 +67,31 @@ export const SpoolModule: ModuleDefinitionInterface = {
 
       const assetGroupTokens = item.assetGroup.assetGroupTokens;
 
-      const provider = await new ethers.providers.JsonRpcProvider(process.env['ETHEREUM_URL']);
-      const contract = await new ethers.Contract(
-        process.env['SPOOL_LENS_ADDRESS']!,
-        SPOOL_ABI,
-        provider,
-      );
+      const contract = await new ethers.Contract(SPOOL_LENS_ADDRESS, SPOOL_ABI, ctx.provider);
       const tokenAmounts = await contract.callStatic.getSmartVaultAssetBalances(item.id, false);
 
-      //TODO: replace above example with the one below
-      // const contract2 = new ctx.ethcall.Contract('0x8aa6174333F75421903b2B5c70DdF8DA5D84f74F', SPOOL_ABI);
-      // const asdf = await ctx.ethcallProvider.all([
-      //   contract.getSmartVaultAssetBalances(item.id, false),
-      // ]);
+      const response = await ctx.axios({
+        url: 'https://graph.spool.fi/graphql',
+        method: 'POST',
+        headers: GQL_HEADERS,
+        data: {
+          query: GET_VAULT_APRS,
+        },
+      });
 
+      const aprs: Aprs = response.data.data;
+      const foundVault = aprs.smartVaults.find((vault) => vault.id === item.id);
+      let adjustedApr = 0;
+      if (foundVault) adjustedApr = Number(foundVault.adjustedApy);
       for (let j = 0; j < assetGroupTokens.length; j++) {
         const token = assetGroupTokens[j];
         const ctxToken = findTokenById(ctx, token.token.id);
-        const tokenAmount = Number(
-          ethers.utils.formatUnits(tokenAmounts[j], token.token.decimals),
-        );
+        const tokenAmount = Number(ethers.utils.formatUnits(tokenAmounts[j], token.token.decimals));
         poolValue.push({
           token: ctxToken,
           tvl: tokenAmount * ctxToken.price,
           apr: {
-            year: 0.2,
+            year: adjustedApr,
           },
         });
       }
@@ -89,21 +99,67 @@ export const SpoolModule: ModuleDefinitionInterface = {
       result.push({
         id: item.name,
         supplied: poolValue,
+        extra: {
+          apr: adjustedApr,
+        },
       });
     }
 
     return result;
   },
 
-  /**
-   * Returns user positions for all pools
-   *
-   * @param ctx Context
-   * @returns UserPosition[]
-   */
   async fetchUserPositions(ctx) {
-    // TODO: Fetch User Positions
-    return [];
+    const res = await ctx.axios({
+      url: SUBGRAPH_ENDPOINT,
+      method: 'POST',
+      headers: GQL_HEADERS,
+      data: {
+        variables: { userId: ctx.user },
+        query: GET_DNFTS_QUERY,
+      },
+    });
+    const userDeposits: UserDeposits = res.data.data;
+    
+    const contract = await new ethers.Contract(SPOOL_LENS_ADDRESS, SPOOL_ABI, ctx.provider);
+
+    const result = [];
+    for (const vault of userDeposits.smartVaults) {
+      if (vault.smartVaultDepositNFTs.length === 0) continue;
+
+      const ctxPool: Pool | undefined = ctx.pools.find(
+        (pool) => pool.id.toLowerCase() === vault.name.toLowerCase(),
+      );
+      if (!ctxPool || !ctxPool.supplied) continue;
+
+      const nftIds: number[] = vault.smartVaultDepositNFTs.map((nft) => parseInt(nft.nftId));
+      const userSvt: BigNumber = await contract.callStatic.getUserSVTBalance(
+        vault.id,
+        ctx.user,
+        nftIds,
+      );
+      const vaultSvt: BigNumber = await contract.callStatic.getSVTTotalSupply(vault.id);
+
+      const vaultAssets = await contract.callStatic.getSmartVaultAssetBalances(vault.id, false);
+
+      for (let i = 0; i < vaultAssets.length; i++) {
+        const token = vault.assetGroup.assetGroupTokens[i];
+        const tokenAmount = Number(
+          ethers.utils.formatUnits(vaultAssets[i].mul(userSvt).div(vaultSvt), token.token.decimals),
+        );
+
+        result.push({
+          id: ctxPool.id,
+          supplied: [
+            {
+              ...ctxPool.supplied[i],
+              balance: tokenAmount,
+            },
+          ],
+        });
+      }
+    }
+
+    return result;
   },
 };
 

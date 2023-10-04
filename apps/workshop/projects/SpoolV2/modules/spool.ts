@@ -9,7 +9,7 @@ import {
   Vault,
 } from '../helpers/gql';
 import { FetchPoolsContext, Pool, Token } from '../../../../sandbox/src/types/module';
-import SPOOL_ABI from '../abis/abi.json';
+import SPOOL_ABI from '../abis/SpoolLens.json';
 import { ethers, BigNumber } from 'ethers';
 
 const SPOOL_LENS_ADDRESS = '0x8aa6174333F75421903b2B5c70DdF8DA5D84f74F';
@@ -30,20 +30,10 @@ export const SpoolModule: ModuleDefinitionInterface = {
         query: GET_VAULTS_QUERY,
       },
     });
-
-    const tokenIds: string[] = [];
-    allTokens.data.data.smartVaults.forEach((smartVault: Vault) => {
-      smartVault.assetGroup.assetGroupTokens.forEach((assetGroupToken) => {
-        const tokenId = assetGroupToken.token.id;
-        tokenIds.push(tokenId);
-      });
-    });
-    const uniqueTokenIds: string[] = [];
-    tokenIds.forEach((item) => {
-      if (uniqueTokenIds.indexOf(item) === -1) {
-        uniqueTokenIds.push(item.toLowerCase());
-      }
-    });
+    const tokenIds: string[] = allTokens.data.data.smartVaults.flatMap((smartVault: Vault) =>
+      smartVault.assetGroup.assetGroupTokens.map((assetGroupToken) => assetGroupToken.token.id),
+    );
+    const uniqueTokenIds: string[] = [...new Set(tokenIds.map((item) => item.toLowerCase()))];
 
     return uniqueTokenIds;
   },
@@ -61,28 +51,26 @@ export const SpoolModule: ModuleDefinitionInterface = {
     const smartVaults = smartVaultsData.data.data.smartVaults;
     const result = [];
 
-    for (let i = 0; i < smartVaults.length; i++) {
-      const item = smartVaults[i];
+    const response = await ctx.axios({
+      url: 'https://graph.spool.fi/graphql',
+      method: 'POST',
+      headers: GQL_HEADERS,
+      data: {
+        query: GET_VAULT_APRS,
+      },
+    });
+    const aprs: Aprs = response.data.data;
+
+    for (const vault of smartVaults) {
       const poolValue = [];
 
-      const assetGroupTokens = item.assetGroup.assetGroupTokens;
+      const assetGroupTokens = vault.assetGroup.assetGroupTokens;
 
       const contract = await new ethers.Contract(SPOOL_LENS_ADDRESS, SPOOL_ABI, ctx.provider);
-      const tokenAmounts = await contract.callStatic.getSmartVaultAssetBalances(item.id, false);
+      const tokenAmounts = await contract.callStatic.getSmartVaultAssetBalances(vault.id, false);
 
-      const response = await ctx.axios({
-        url: 'https://graph.spool.fi/graphql',
-        method: 'POST',
-        headers: GQL_HEADERS,
-        data: {
-          query: GET_VAULT_APRS,
-        },
-      });
-
-      const aprs: Aprs = response.data.data;
-      const foundVault = aprs.smartVaults.find((vault) => vault.id === item.id);
-      let adjustedApr = 0;
-      if (foundVault) adjustedApr = Number(foundVault.adjustedApy);
+      const foundVault = aprs.smartVaults.find((element) => element.id === vault.id);
+      const adjustedApr = foundVault ? Number(foundVault.adjustedApy) : 0;
       for (let j = 0; j < assetGroupTokens.length; j++) {
         const token = assetGroupTokens[j];
         const ctxToken = findTokenById(ctx, token.token.id);
@@ -97,7 +85,7 @@ export const SpoolModule: ModuleDefinitionInterface = {
       }
 
       result.push({
-        id: item.name,
+        id: vault.name,
         supplied: poolValue,
         extra: {
           apr: adjustedApr,
@@ -119,7 +107,7 @@ export const SpoolModule: ModuleDefinitionInterface = {
       },
     });
     const userDeposits: UserDeposits = res.data.data;
-    
+
     const contract = await new ethers.Contract(SPOOL_LENS_ADDRESS, SPOOL_ABI, ctx.provider);
 
     const result = [];
@@ -131,15 +119,12 @@ export const SpoolModule: ModuleDefinitionInterface = {
       );
       if (!ctxPool || !ctxPool.supplied) continue;
 
-      const nftIds: number[] = vault.smartVaultDepositNFTs.map((nft) => parseInt(nft.nftId));
-      const userSvt: BigNumber = await contract.callStatic.getUserSVTBalance(
-        vault.id,
-        ctx.user,
-        nftIds,
-      );
-      const vaultSvt: BigNumber = await contract.callStatic.getSVTTotalSupply(vault.id);
-
-      const vaultAssets = await contract.callStatic.getSmartVaultAssetBalances(vault.id, false);
+      const nftIds: Number[] = vault.smartVaultDepositNFTs.map((nft) => parseInt(nft.nftId));
+      const [userSvt, vaultSvt, vaultAssets] = await Promise.all([
+        contract.callStatic.getUserSVTBalance(vault.id, ctx.user, nftIds),
+        contract.callStatic.getSVTTotalSupply(vault.id),
+        contract.callStatic.getSmartVaultAssetBalances(vault.id, false),
+      ]);
 
       for (let i = 0; i < vaultAssets.length; i++) {
         const token = vault.assetGroup.assetGroupTokens[i];

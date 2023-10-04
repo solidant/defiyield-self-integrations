@@ -6,7 +6,7 @@ const project: ProjectDefinitionInterface = {
   categories: ['Yield Aggregator'],
   links: {
     logo: 'https://icons.de.fi/spool-dao-token/coingecko.webp',
-    url: 'https://mainnet-v2.spool.fi/',
+    url: 'https://app.spool.fi',
     discord: 'https://discord.com/invite/kCDC7BWxrw',
     telegram: 'https://t.me/SpoolFi',
     twitter: 'https://twitter.com/spoolfi',
